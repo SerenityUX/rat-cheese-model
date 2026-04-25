@@ -1,0 +1,10 @@
+{
+  "strategy": "SupervisedImitation",
+  "policy_source": "/Users/thomasstubblefield/EscapeTheMaze/training/maze_policy_final.pt",
+  "input_size": 1176,
+  "max_rows": 14,
+  "max_cols": 14,
+  "input_name": "obs",
+  "output_name": "logits",
+  "maze_source": "/Users/thomasstubblefield/EscapeTheMaze/training/runtime_ui_mazes/maze_000000/maze.json"
+}

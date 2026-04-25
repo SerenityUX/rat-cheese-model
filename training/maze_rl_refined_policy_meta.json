@@ -1,0 +1,13 @@
+{
+  "strategy": "REINFORCE_refine",
+  "policy_in": "maze_supervised_policy_best_saved.pt",
+  "policy_out": "maze_rl_refined_policy.pt",
+  "final_path": "maze_policy_final.pt",
+  "pre_rl_val_maze_accuracy": 0.835,
+  "pre_rl_holdout_maze_accuracy": 0.826,
+  "pre_rl_holdout_n": 1000,
+  "pre_rl_eval_seed": 88000,
+  "best_val_maze_accuracy": 0.72,
+  "best_at": "rl_epoch_1",
+  "split_seed": 42
+}

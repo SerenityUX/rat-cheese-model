@@ -1,0 +1,13 @@
+{
+  "strategy": "SupervisedImitation",
+  "input_size": 1176,
+  "max_rows": 14,
+  "max_cols": 14,
+  "actions": {
+    "0": "up",
+    "1": "right",
+    "2": "down",
+    "3": "left"
+  },
+  "model_path": "maze_supervised_policy.pt"
+}

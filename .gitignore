@@ -1,0 +1,18 @@
+.DS_Store
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local virtual environments
+.venv/
+training/.venv/
+
+# Generated training/runtime artifacts
+training/mazes/
+training/runtime_ui_mazes/
+training/*.pt
+training/*.onnx
+
+# Local logs
+*.log

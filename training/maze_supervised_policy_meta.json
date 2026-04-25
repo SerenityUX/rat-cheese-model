@@ -1,0 +1,27 @@
+{
+  "strategy": "SupervisedImitation",
+  "input_size": 1176,
+  "max_rows": 14,
+  "max_cols": 14,
+  "train_split_by_maze": true,
+  "split_seed": 42,
+  "batch_size": 512,
+  "lr": 0.0007,
+  "dist_loss_weight": 0.15,
+  "actions": {
+    "0": "up",
+    "1": "right",
+    "2": "down",
+    "3": "left"
+  },
+  "model_path": "maze_supervised_policy.pt",
+  "epochs_ran": 30,
+  "epochs_planned": 30,
+  "dagger_phases": 5,
+  "best_maze_accuracy": 0.907,
+  "best_maze_at": "bc_epoch_28",
+  "last_maze_accuracy": 0.905,
+  "masked_legal_loss": true,
+  "aux_dist_head": true,
+  "dagger_enabled": true
+}

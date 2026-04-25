@@ -1,0 +1,467 @@
+import argparse
+import json
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
+
+import torch
+
+BASE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = BASE_DIR.parent
+
+
+def _load_module(file_name: str, module_name: str):
+    module_path = BASE_DIR / file_name
+    spec = spec_from_file_location(module_name, module_path)
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _pick_policy_path():
+    candidates = [
+        BASE_DIR / "maze_policy_final.pt",
+        BASE_DIR / "maze_supervised_policy.pt",
+        BASE_DIR / "maze_supervised_policy_best_saved.pt",
+        BASE_DIR / "maze_supervised_policy_best.pt",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    raise FileNotFoundError(
+        "No supervised policy checkpoint found. Expected one of: "
+        "maze_policy_final.pt, maze_supervised_policy.pt, maze_supervised_policy_best_saved.pt, "
+        "maze_supervised_policy_best.pt"
+    )
+
+
+def _pick_maze_json():
+    runtime = sorted((BASE_DIR / "runtime_ui_mazes").glob("maze_*/maze.json"))
+    if runtime:
+        return runtime[-1]
+    mazes = sorted((BASE_DIR / "mazes").glob("maze_*/maze.json"))
+    if mazes:
+        return mazes[0]
+    raise FileNotFoundError("No maze JSON found in runtime_ui_mazes/ or mazes/")
+
+
+def _infer_dims(supervised_module):
+    meta_path = BASE_DIR / "maze_supervised_policy_meta.json"
+    if meta_path.is_file():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        mr = int(meta.get("max_rows", 0))
+        mc = int(meta.get("max_cols", 0))
+        if mr > 0 and mc > 0:
+            return mr, mc
+
+    mazes = supervised_module.load_mazes(str(BASE_DIR / "mazes"))
+    _, max_rows, max_cols = supervised_module.prepare_contexts(mazes)
+    return max_rows, max_cols
+
+
+def _build_html():
+    return """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Escape The Maze (Web)</title>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; background: white; overflow: hidden; }
+    body { display: flex; align-items: center; justify-content: center; }
+    #mazeHost { cursor: pointer; line-height: 0; }
+  </style>
+</head>
+<body>
+  <div id="mazeHost"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <script>
+    const ACTIONS = {
+      0: [-1, 0], // up
+      1: [0, 1],  // right
+      2: [1, 0],  // down
+      3: [0, -1], // left
+    };
+
+    let modelMeta, mazeRaw, session;
+    let walls, pos, goal, start, prevPos;
+    let pathCells = [];
+    let finished = false;
+    let failed = false;
+    let isStepping = false;
+    let autoTimer = null;
+    let audioCtx = null;
+    const mazeHost = document.getElementById('mazeHost');
+
+    function buildWallGrid(maze) {
+      const rows = maze.rows, cols = maze.cols, cellSize = maze.cell_size;
+      const out = Array.from({length: rows}, () =>
+        Array.from({length: cols}, () => ({ N: false, E: false, S: false, W: false }))
+      );
+      for (const seg of maze.lines) {
+        const [p1, p2] = seg;
+        const [x1, y1] = p1;
+        const [x2, y2] = p2;
+        if (y1 === y2) {
+          const y = y1;
+          const x = Math.min(x1, x2);
+          const c = Math.floor(x / cellSize);
+          if (y === rows * cellSize) {
+            const r = rows - 1;
+            out[r][c].S = true;
+          } else {
+            const r = Math.floor(y / cellSize);
+            out[r][c].N = true;
+            if (r > 0) out[r - 1][c].S = true;
+          }
+        } else if (x1 === x2) {
+          const x = x1;
+          const y = Math.min(y1, y2);
+          const r = Math.floor(y / cellSize);
+          if (x === cols * cellSize) {
+            const c = cols - 1;
+            out[r][c].E = true;
+          } else {
+            const c = Math.floor(x / cellSize);
+            out[r][c].W = true;
+            if (c > 0) out[r][c - 1].E = true;
+          }
+        }
+      }
+      return out;
+    }
+
+    function makeFreshMaze(minSize = 8, maxSize = 14, cellSize = 24) {
+      const rows = Math.floor(Math.random() * (maxSize - minSize + 1)) + minSize;
+      const cols = Math.floor(Math.random() * (maxSize - minSize + 1)) + minSize;
+      const walls = Array.from({ length: rows }, () =>
+        Array.from({ length: cols }, () => ({ N: true, E: true, S: true, W: true }))
+      );
+      const seen = Array.from({ length: rows }, () => Array(cols).fill(false));
+      const stack = [[0, 0]];
+      seen[0][0] = true;
+
+      function neighbors(r, c) {
+        const out = [];
+        if (r > 0) out.push([r - 1, c, 'N', 'S']);
+        if (r < rows - 1) out.push([r + 1, c, 'S', 'N']);
+        if (c > 0) out.push([r, c - 1, 'W', 'E']);
+        if (c < cols - 1) out.push([r, c + 1, 'E', 'W']);
+        return out;
+      }
+
+      while (stack.length) {
+        const [r, c] = stack[stack.length - 1];
+        const cand = neighbors(r, c).filter(([nr, nc]) => !seen[nr][nc]);
+        if (!cand.length) {
+          stack.pop();
+          continue;
+        }
+        const [nr, nc, d, opp] = cand[Math.floor(Math.random() * cand.length)];
+        walls[r][c][d] = false;
+        walls[nr][nc][opp] = false;
+        seen[nr][nc] = true;
+        stack.push([nr, nc]);
+      }
+
+      const lines = [];
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const x = c * cellSize;
+          const y = r * cellSize;
+          const cell = walls[r][c];
+          if (cell.N) lines.push([[x, y], [x + cellSize, y]]);
+          if (cell.W) lines.push([[x, y], [x, y + cellSize]]);
+          if (r === rows - 1 && cell.S) lines.push([[x, y + cellSize], [x + cellSize, y + cellSize]]);
+          if (c === cols - 1 && cell.E) lines.push([[x + cellSize, y], [x + cellSize, y + cellSize]]);
+        }
+      }
+
+      return {
+        maze_id: `web_maze_${Date.now()}`,
+        rows,
+        cols,
+        cell_size: cellSize,
+        start: [0, 0],
+        end: [rows - 1, cols - 1],
+        lines,
+      };
+    }
+
+    function canMove(cur, action) {
+      const [r, c] = cur;
+      const [dr, dc] = ACTIONS[action];
+      const nr = r + dr, nc = c + dc;
+      if (nr < 0 || nr >= mazeRaw.rows || nc < 0 || nc >= mazeRaw.cols) return [false, cur];
+      if (action === 0 && walls[r][c].N) return [false, cur];
+      if (action === 1 && walls[r][c].E) return [false, cur];
+      if (action === 2 && walls[r][c].S) return [false, cur];
+      if (action === 3 && walls[r][c].W) return [false, cur];
+      return [true, [nr, nc]];
+    }
+
+    function buildObservation(cur) {
+      const maxRows = modelMeta.max_rows;
+      const maxCols = modelMeta.max_cols;
+      const size = maxRows * maxCols;
+      const north = new Float32Array(size);
+      const east  = new Float32Array(size);
+      const south = new Float32Array(size);
+      const west  = new Float32Array(size);
+      const posHot = new Float32Array(size);
+      const goalHot = new Float32Array(size);
+
+      for (let r = 0; r < mazeRaw.rows; r++) {
+        for (let c = 0; c < mazeRaw.cols; c++) {
+          const idx = r * maxCols + c;
+          north[idx] = walls[r][c].N ? 1 : 0;
+          east[idx]  = walls[r][c].E ? 1 : 0;
+          south[idx] = walls[r][c].S ? 1 : 0;
+          west[idx]  = walls[r][c].W ? 1 : 0;
+        }
+      }
+      posHot[cur[0] * maxCols + cur[1]] = 1;
+      goalHot[goal[0] * maxCols + goal[1]] = 1;
+
+      const obs = new Float32Array(size * 6);
+      obs.set(north, 0);
+      obs.set(east, size);
+      obs.set(south, size * 2);
+      obs.set(west, size * 3);
+      obs.set(posHot, size * 4);
+      obs.set(goalHot, size * 5);
+      return obs;
+    }
+
+    function argmaxValid(logits) {
+      const valid = [];
+      for (let a = 0; a < 4; a++) {
+        const [ok, nxt] = canMove(pos, a);
+        if (ok) valid.push([a, nxt]);
+      }
+      if (!valid.length) {
+        let best = 0;
+        for (let i = 1; i < logits.length; i++) if (logits[i] > logits[best]) best = i;
+        return best;
+      }
+
+      const visited = new Set(pathCells.map(([r, c]) => `${r},${c}`));
+      let candidates = valid;
+      if (prevPos) {
+        const noImmediateBack = candidates.filter(([, nxt]) => !(nxt[0] === prevPos[0] && nxt[1] === prevPos[1]));
+        if (noImmediateBack.length) candidates = noImmediateBack;
+      }
+      const noVisited = candidates.filter(([, nxt]) => !visited.has(`${nxt[0]},${nxt[1]}`));
+      if (noVisited.length) candidates = noVisited;
+
+      let best = candidates[0][0];
+      for (const [a] of candidates) if (logits[a] > logits[best]) best = a;
+      return best;
+    }
+
+    function renderMaze() {
+      const cell = mazeRaw.cell_size;
+      const width = mazeRaw.cols * cell;
+      const height = mazeRaw.rows * cell;
+      const pathPts = pathCells.map(([r, c]) => `${c * cell + cell/2},${r * cell + cell/2}`).join(' ');
+      const [sr, sc] = start;
+      const [gr, gc] = goal;
+      const [pr, pc] = pos;
+      const lines = mazeRaw.lines.map(([[x1,y1],[x2,y2]]) =>
+        `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="black" stroke-width="2" />`
+      ).join('');
+      mazeHost.innerHTML = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+          <rect x="0" y="0" width="100%" height="100%" fill="white" />
+          ${lines}
+          ${pathCells.length >= 2 ? `<polyline points="${pathPts}" fill="none" stroke="red" stroke-width="3" />` : ''}
+          <circle cx="${sc * cell + cell/2}" cy="${sr * cell + cell/2}" r="5" fill="green" />
+          <circle cx="${gc * cell + cell/2}" cy="${gr * cell + cell/2}" r="5" fill="blue" />
+          <circle cx="${pc * cell + cell/2}" cy="${pr * cell + cell/2}" r="6" fill="#ff9800" />
+        </svg>
+      `;
+    }
+
+    async function stepOnce() {
+      if (finished || failed) return;
+      const obs = buildObservation(pos);
+      const input = new ort.Tensor('float32', obs, [1, modelMeta.input_size]);
+      const out = await session.run({ [modelMeta.input_name]: input });
+      const logits = out[modelMeta.output_name].data;
+      const action = argmaxValid(logits);
+      const [moved, nxt] = canMove(pos, action);
+      const oldPos = [pos[0], pos[1]];
+      pos = moved ? nxt : pos;
+      prevPos = oldPos;
+      if (pathCells[pathCells.length - 1][0] !== pos[0] || pathCells[pathCells.length - 1][1] !== pos[1]) {
+        pathCells.push([pos[0], pos[1]]);
+      }
+      finished = (pos[0] === goal[0] && pos[1] === goal[1]);
+      if (pathCells.length >= (mazeRaw.rows * mazeRaw.cols * 2)) {
+        failed = !finished;
+      }
+      renderMaze();
+      if (finished) playSuccessSound();
+    }
+
+    function resetMaze() {
+      mazeRaw = makeFreshMaze();
+      walls = buildWallGrid(mazeRaw);
+      start = [mazeRaw.start[0], mazeRaw.start[1]];
+      goal = [mazeRaw.end[0], mazeRaw.end[1]];
+      pos = [start[0], start[1]];
+      prevPos = null;
+      pathCells = [[pos[0], pos[1]]];
+      finished = false;
+      failed = false;
+      renderMaze();
+    }
+
+    async function autoSolveLoop() {
+      if (isStepping || finished || failed) return;
+      isStepping = true;
+      try {
+        await stepOnce();
+      } finally {
+        isStepping = false;
+      }
+    }
+
+    function startAutoSolve() {
+      if (autoTimer) clearInterval(autoTimer);
+      autoTimer = setInterval(() => {
+        autoSolveLoop().catch(console.error);
+      }, 0);
+    }
+
+    function playSuccessSound() {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!audioCtx) audioCtx = new Ctx();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+
+      const now = audioCtx.currentTime;
+      const notes = [523.25, 659.25, 783.99, 1046.5]; // C5 E5 G5 C6
+      for (let i = 0; i < notes.length; i++) {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(notes[i], now + i * 0.09);
+        gain.gain.setValueAtTime(0.0001, now + i * 0.09);
+        gain.gain.exponentialRampToValueAtTime(0.15, now + i * 0.09 + 0.01);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.09 + 0.08);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(now + i * 0.09);
+        osc.stop(now + i * 0.09 + 0.09);
+      }
+    }
+
+    async function main() {
+      if (window.location.protocol === 'file:') {
+        throw new Error('Open via http(s), not file://. Run: python3 -m http.server 8000 (inside web/)');
+      }
+      const metaRes = await fetch('./web_meta.json');
+      if (!metaRes.ok) throw new Error(`web_meta.json fetch failed (${metaRes.status})`);
+      modelMeta = await metaRes.json();
+
+      session = await ort.InferenceSession.create('./model.onnx', {
+        executionProviders: ['wasm'],
+      });
+      if (!modelMeta.input_name) modelMeta.input_name = session.inputNames[0];
+      if (!modelMeta.output_name) modelMeta.output_name = session.outputNames[0];
+
+      resetMaze();
+      startAutoSolve();
+      mazeHost.addEventListener('click', async () => {
+        if (finished || failed) {
+          resetMaze();
+          return;
+        }
+      });
+    }
+
+    main().catch(err => {
+      console.error(err);
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+def export_to_web(output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    supervised_module = _load_module(
+        "train-supervised-imitation-maze-model.py",
+        "train_supervised_imitation_maze_model",
+    )
+    policy_path = _pick_policy_path()
+    max_rows, max_cols = _infer_dims(supervised_module)
+    input_size = max_rows * max_cols * 6
+
+    model = supervised_module.SmallMazePolicy(
+        input_size=input_size, max_rows=max_rows, max_cols=max_cols
+    )
+    state = torch.load(policy_path, map_location="cpu")
+    model.load_state_dict(state)
+    model.eval()
+
+    dummy = torch.zeros(1, input_size, dtype=torch.float32)
+    onnx_path = output_dir / "model.onnx"
+    torch.onnx.export(
+        model,
+        dummy,
+        onnx_path,
+        input_names=["obs"],
+        output_names=["logits", "aux_distance"],
+        opset_version=17,
+        do_constant_folding=True,
+    )
+
+    maze_json_src = _pick_maze_json()
+    maze_payload = json.loads(maze_json_src.read_text(encoding="utf-8"))
+    (output_dir / "maze.json").write_text(json.dumps(maze_payload, indent=2), encoding="utf-8")
+
+    unsolved_path = Path(maze_payload["images"]["unsolved"])
+    if not unsolved_path.is_absolute():
+        if (BASE_DIR / unsolved_path).is_file():
+            unsolved_path = BASE_DIR / unsolved_path
+        elif (ROOT_DIR / unsolved_path).is_file():
+            unsolved_path = ROOT_DIR / unsolved_path
+    if unsolved_path.is_file():
+        (output_dir / "unsolved.svg").write_text(
+            unsolved_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+    meta = {
+        "strategy": "SupervisedImitation",
+        "policy_source": str(policy_path),
+        "input_size": input_size,
+        "max_rows": max_rows,
+        "max_cols": max_cols,
+        "input_name": "obs",
+        "output_name": "logits",
+        "maze_source": str(maze_json_src),
+    }
+    (output_dir / "web_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (output_dir / "index.html").write_text(_build_html(), encoding="utf-8")
+
+    print(f"[export-web] Wrote {onnx_path}")
+    print(f"[export-web] Wrote {output_dir / 'index.html'}")
+    print(f"[export-web] Wrote {output_dir / 'maze.json'}")
+    print(f"[export-web] Wrote {output_dir / 'web_meta.json'}")
+    print(f"[export-web] Model source: {policy_path}")
+    print(f"[export-web] Maze source: {maze_json_src}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Export maze policy + static web app for GitHub Pages.")
+    parser.add_argument(
+        "--out",
+        default=str(ROOT_DIR),
+        help="Output directory for static web assets (default: repo root)",
+    )
+    args = parser.parse_args()
+    export_to_web(Path(args.out).resolve())
