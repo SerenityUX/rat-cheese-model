@@ -1,4 +1,4 @@
-## My story so far
+## little rat & cheese model
 
 I started off by making an RL-based model.
 
