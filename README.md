@@ -1,5 +1,3 @@
-# Escape The Maze
-
 ## My story so far
 
 I started off by making an RL-based model.
